@@ -8,6 +8,10 @@ suppressPackageStartupMessages({
 	library(janitor)
 	library(writexl)
 	library(wbstats)
+	library(glmnet)
+	library(mice)
+	library(randomForest)
+	library(caret)
 })
 
 #Settings
@@ -23,6 +27,8 @@ stopifnot(file.exists(in_path))
 
 #Load social development and infrastructure wide-format data
 panel_raw <- readr::read_csv(in_path, show_col_types=FALSE)
+
+
 
 time_col <- dplyr::case_when(
 	"year" %in% names(panel_raw) ~ "year",
@@ -166,6 +172,185 @@ if(any(drop_identical)) {
 
 panel_final <- panel_kept %>%
 	select(all_of(id_cols), all_of(ind2[!drop_identical]))
+	
+
+df <- panel_final %>%
+	mutate(
+		iso3c = toupper(str_trim(iso3c)),
+		year = as.numeric(year)
+		) %>%
+		left_join(u5, by= c("iso3c", "year"))
+	
+
+#----Preprocessing Data-----
+
+df <- panel_final
+#make one target variable from female and male life expectancy
+df <- df %>% 
+	mutate(
+		life_exp_avg = rowMeans(
+			cbind(
+				social_development_sp_dyn_le00_fe_in,
+				social_development_sp_dyn_le00_ma_in
+			),
+			na.rm = TRUE
+		)
+	)
+	
+#if both are missing, rowMeans will return NaN
+df <- df %>%
+	mutate(
+		life_exp_avg = ifelse(is.nan(life_exp_avg), NA, life_exp_avg)
+	)
+	
+target <- "life_exp_avg"
+
+id_cols <- c("iso3c", "iso2c", "country", "year")
+
+#keep rows with the target only
+model_df <- df%>% filter(!is.na(.data[[target]]))
+
+#select only numeric predictors
+x_df <- model_df %>%
+	select(-all_of(id_cols), 
+	-all_of(target),
+	-social_development_sp_dyn_le00_fe_in,
+	-social_development_sp_dyn_le00_ma_in)  %>%
+	select(where(is.numeric))
+
+#median imputation for missing predictor values 	
+x_df <- x_df %>% 
+	mutate(across(everything(), ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+
+x_base <- model_df %>%
+	select(-any_of(id_cols), -all_of(target)) %>%
+	select(where(is.numeric)) %>%
+	select(
+		-social_development_sp_dyn_le00_fe_in,
+		-social_development_sp_dyn_le00_ma_in) %>%
+	select(where(~ !all(is.na(.x)))) %>%
+	select(where(~ dplyr::n_distinct(na.omit(.x)) > 1))
+	
+
+	
+y <- model_df[[target]]
+
+x_model <- x_base %>%
+	select(where( ~sd(.x, na.rm = TRUE) > 0))
+	
+cor_max <- cor(x_model, use="pairwise.complete.obs")
+high_cor_idx <- caret::findCorrelation(cor_max, cutoff = 0.95)
+
+if(length(high_cor_idx) >0 ) {
+	x_model <- x_model[, -high_cor_idx, drop=FALSE]
+}
+
+#median imputation base 
+x_median <- x_model %>%
+	mutate(across(everything(), ~ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+x_median_mat <- as.matrix(x_median)
+
+
+
+mice_model <- mice(
+	x_base,
+	m = 1,
+	method = "cart",
+	maxit = 5,
+	seed = 123,
+	printFlag = FALSE
+)
+
+x_mice <- complete(mice_model)
+x_mice_mat <- as.matrix(x_mice)
+
+
+#----LASSO Median Imputation---
+set.seed(123)
+cv_med <- cv.glmnet(
+	x_median_mat,
+	y,
+	alpha=1,
+	standardize = TRUE)
+	
+lasso_med <- glmnet(
+	x_median_mat,
+	y,
+	alpha = 1,
+	lambda = cv_med$lambda.min,
+	standardize = TRUE)
+
+coef_med <- as.matrix(coef(lasso_med))
+nonzero_med <- coef_med[coef_med[,1] !=0, , drop=FALSE]
+
+cat("LASSO RESULTS: MEDIAN IMPUTATION\n")
+print(nonzero_med)
+
+#----LASSO Mice Imputation-----
+set.seed(123)
+
+cv_mice <- cv.glmnet(
+	x_mice_mat,
+	y,
+	alpha=1,
+	standardize = TRUE)
+	
+lasso_mice <- glmnet(
+	x_mice_mat,
+	y,
+	alpha=1,
+	lambda = cv_mice$lambda.min,
+	standardize=TRUE)
+
+coef_mice <- as.matrix(coef(lasso_mice))
+nonzero_mice <- coef_mice[coef_mice[,1] !=0, , drop=FALSE]
+
+cat("LASSO RESULTS: MICE IMPUTATION\n")
+
+#---Random Forest Median Imputation---
+set.seed(123)
+rf_med <- randomForest(
+	x=x_median_mat,
+	y=y,
+	ntree = 500,
+	importance = TRUE
+)
+
+cat("RF RESULTS: MEDIAN IMPUTATION\n")
+print(rf_med)
+
+#----Random Forest MICE Imputation----
+set.seed(123)
+
+rf_mice <- randomForest(
+	x = x_mice_mat,
+	y=y,
+	ntree=500,
+	importance=TRUE)
+	
+cat("RANDOM FOREST: MICE IMPUTATION\n")
+print(rf_mice)
+			
+#Compare selected variables
+
+med_vars <- rownames(nonzero_med)
+mice_vars <- rownames(nonzero_mice)
+
+cat("Variables in both LASSO models\n")
+print(intersect(med_vars, mice_vars))
+
+cat("Variables only in median LASSO\n")
+print(setdiff(med_vars, mice_vars))
+
+cat("Variables only in MICE LASSO\n")
+print(setdiff(mice_vars, med_vars))
+
+cat("Top RF Variables: Median\n")
+print(importance(rf_med))
+
+cat("Top RF Variables: Mice\n")
+print(importance(rf_mice))
+
 	
 id_base <- c("iso3c", "iso2c", "country", "year")
 ind_cols_final <- setdiff(names(panel_final), id_base)
